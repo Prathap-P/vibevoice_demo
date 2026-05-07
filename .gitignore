@@ -1,0 +1,26 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Model weights (large files — download via huggingface_hub)
+models/
+
+# Cloned VibeVoice repo (clone separately: git clone https://github.com/microsoft/VibeVoice.git)
+VibeVoice/
+
+# Environment
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
