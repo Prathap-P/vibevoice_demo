@@ -24,3 +24,4 @@ VibeVoice/
 # IDE
 .idea/
 .vscode/
+.github/instructions/wmt-copilot.instructions.md
