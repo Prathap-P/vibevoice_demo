@@ -16,6 +16,15 @@ import threading
 import time
 import traceback
 
+# ⚠️  MUST be set before torch / transformers import
+# HF_HUB_OFFLINE=1 : skip the "freshness check" HEAD request to huggingface.co
+#   — everything is already downloaded locally; the network call just adds ~30s
+#   of retries on corporate networks with SSL inspection.
+# PYTORCH_ENABLE_MPS_FALLBACK=1 : allow unsupported MPS ops to fall back to CPU
+#   instead of crashing (required for diffusion scheduler ops on Apple Silicon).
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import numpy as np
 import scipy.io.wavfile as wavfile
 import torch
@@ -35,11 +44,31 @@ CFG_SCALE    = 1.5
 CHUNK_SIZE   = 1000   # max chars per synthesis chunk (tweak 500–2000 to balance quality vs memory)
 
 TOP_5_VOICES = [
+    "pt-Spk1_man",
+    "de-Spk1_woman",
+    "in-Samuel_man",
+    "en-Frank_man",
     "en-Carter_man",
-    "en-Emma_woman",
+    "jp-Spk1_woman",
+    "it-Spk1_man",
+    "nl-Spk1_woman",
+    "de-Spk0_man",
+    "sp-Spk1_man",
+    "nl-Spk0_man",
+    "pl-Spk0_man",
+    "it-Spk0_woman",
+    "en-Mike_man",
+    "fr-Spk0_man",
     "en-Davis_man",
     "en-Grace_woman",
-    "en-Frank_man",
+    "kr-Spk1_man",
+    "sp-Spk0_woman",
+    "en-Emma_woman",
+    "pl-Spk1_woman",
+    "fr-Spk1_woman",
+    "kr-Spk0_woman",
+    "pt-Spk0_woman",
+    "jp-Spk0_man",
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,6 +99,44 @@ for _mod_path in ("vibevoice.schedule", "vibevoice.modular", "vibevoice"):
 if AudioStreamer is None:
     print("[FATAL] Could not locate AudioStreamer. Ensure the repo is installed correctly.")
     raise SystemExit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MPS UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
+def _move_scheduler_to_device(scheduler, device: str) -> None:
+    """
+    Move all tensor attributes of a diffusion noise scheduler to `device`.
+    Required because scheduler.from_config() always creates CPU tensors,
+    even after the parent model has been moved to MPS/CUDA.
+    """
+    if scheduler is None or device == "cpu":
+        return
+    for attr in list(vars(scheduler).keys()):
+        val = getattr(scheduler, attr, None)
+        if isinstance(val, torch.Tensor):
+            try:
+                setattr(scheduler, attr, val.to(device))
+            except Exception:
+                pass
+
+
+def _move_prefilled_to_device(obj, device: str):
+    """Recursively move all tensors in a KV-cache structure to device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, (list, tuple)):
+        moved = [_move_prefilled_to_device(x, device) for x in obj]
+        return type(obj)(moved)
+    elif isinstance(obj, dict):
+        return {k: _move_prefilled_to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _clear_mps_cache():
+    """Free MPS memory between synthesis passes to prevent OOM."""
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,6 +185,10 @@ def load_model(model_path: str, device: str) -> tuple:
 
     model.eval()
 
+    # Configure DPM-Solver++ noise scheduler.
+    # NOTE: Scheduler tensors are intentionally kept on CPU — set_timesteps() uses numpy
+    # extensively and explicitly calls self.sigmas.to("cpu").  Device-consistent arithmetic
+    # in dpm_solver.step() is handled by moving sigmas temporarily inside that method.
     try:
         model.model.noise_scheduler = model.model.noise_scheduler.from_config(
             model.model.noise_scheduler.config,
@@ -126,8 +197,18 @@ def load_model(model_path: str, device: str) -> tuple:
         )
     except Exception as e:
         print(f"  [WARN] Noise-scheduler tweak skipped ({e}); using defaults.")
+
     model.set_ddpm_inference_steps(num_steps=DDPM_STEPS)
 
+    # ── Device verification ──────────────────────────────────────────────────
+    param_devices = set(str(p.device) for p in model.parameters())
+    print(f"  🖥️   Confirmed device : {param_devices}")
+    if device == "mps" and param_devices == {"mps:0"}:
+        print(f"  ✅  Metal GPU (MPS) active — using Apple Silicon GPU")
+    elif device == "mps":
+        print(f"  ⚠️   Mixed devices detected — some ops may run on CPU")
+    else:
+        print(f"  ✅  Running on {device.upper()}")
     print(f"  ✅  Model ready in {time.perf_counter() - t0:.1f}s")
     return processor, model
 
@@ -136,12 +217,18 @@ def load_model(model_path: str, device: str) -> tuple:
 # VOICE PRESET LOADING
 # ──────────────────────────────────────────────────────────────────────────────
 def load_voice_preset(pt_path: str) -> object:
-    """Load a pre-computed KV-cache voice preset from a .pt file."""
-    return torch.load(
-        pt_path,
-        map_location=torch.device(DEVICE),
-        weights_only=False,
-    )
+    """
+    Load a pre-computed KV-cache voice preset from a .pt file.
+
+    ⚠️  Do NOT call _move_prefilled_to_device() here.
+    The preset's inner objects (lm, tts_lm, neg_lm, neg_tts_lm) are
+    ModelOutput instances — subclasses of OrderedDict.  The recursive
+    helper converts them to plain dicts, stripping .past_key_values
+    attribute access that model.generate() requires.
+    torch.load(map_location=device) already places every tensor on the
+    correct device, so no further movement is needed.
+    """
+    return torch.load(pt_path, map_location=torch.device(DEVICE), weights_only=False)
 
 
 def build_voice_preset_from_wav(model, processor, wav_path: str) -> object:
@@ -398,6 +485,7 @@ def run_standard_mode(processor, model, text: str) -> None:
             out_path = f"output_{voice}.wav"
             save_wav(out_path, audio)
             print_report(voice, text, audio, elapsed, ttfa)
+            _clear_mps_cache()   # free MPS memory between voices
 
             duration = len(audio) / SAMPLE_RATE
             rtf      = elapsed / duration if duration > 0 else float("inf")
