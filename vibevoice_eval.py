@@ -10,6 +10,7 @@ VibeVoice-TTS  |  Quick-Look Evaluation Script
 ──────────────────────────────────────────────────────────────────────────────
 """
 
+import argparse
 import copy
 import os
 import threading
@@ -462,6 +463,48 @@ def print_report(label: str, text: str, audio: np.ndarray, total_elapsed: float,
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# HEADLESS SINGLE-VOICE  (used by Tier 2 parallel segment pipelines)
+# ──────────────────────────────────────────────────────────────────────────────
+def _run_single_voice(
+    processor, model, text: str, voice: str, out_path: str = None
+) -> None:
+    """
+    Synthesise `text` with a single voice preset and write the result to disk.
+    Called when --voice is passed on the command line; designed to be spawned
+    as a subprocess by a Tier 2 parallel orchestrator.
+
+    Args:
+        processor  : loaded VibeVoiceStreamingProcessor
+        model      : loaded VibeVoiceStreamingForConditionalGenerationInference
+        text       : input text to synthesise
+        voice      : voice preset name (e.g. 'en-Carter_man')
+        out_path   : output WAV path; defaults to 'output_{voice}.wav'
+    """
+    pt_path = os.path.join(VOICES_DIR, f"{voice}.pt")
+    if not os.path.exists(pt_path):
+        print(f"\n[FATAL] Voice preset not found: {pt_path}")
+        print( "        Available presets are listed in TOP_5_VOICES.")
+        raise SystemExit(1)
+
+    if out_path is None:
+        out_path = f"output_{voice}.wav"
+
+    print(f"\n  🎙️  [Headless] Voice : {voice}  →  {out_path}")
+    try:
+        prefilled   = load_voice_preset(pt_path)
+        t0          = time.perf_counter()
+        audio, ttfa = synthesize_long(model, processor, text, prefilled)
+        elapsed     = time.perf_counter() - t0
+        save_wav(out_path, audio)
+        print_report(voice, text, audio, elapsed, ttfa)
+        _clear_mps_cache()
+    except Exception as exc:
+        print(f"  ❌  Headless synthesis failed for {voice}: {exc}")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # MODE 1 — STANDARD
 # ──────────────────────────────────────────────────────────────────────────────
 def run_standard_mode(processor, model, text: str) -> None:
@@ -542,27 +585,69 @@ def run_cloning_mode(processor, model, text: str) -> None:
 # ENTRY POINT
 # ──────────────────────────────────────────────────────────────────────────────
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="VibeVoice-TTS evaluation / single-voice synthesis",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python vibevoice_eval.py                             # full eval (all 25 voices)\n"
+            "  python vibevoice_eval.py --voice en-Carter_man       # single voice, reads input_text.txt\n"
+            "  python vibevoice_eval.py --voice en-Carter_man \\\n"
+            "      --text 'Hello world' --out hello.wav            # fully headless\n"
+            "  python vibevoice_eval.py --steps 5                  # aggressive step reduction\n"
+        ),
+    )
+    parser.add_argument(
+        "--text", type=str, default=None,
+        help="Text string to synthesise. If omitted, reads from input_text.txt.",
+    )
+    parser.add_argument(
+        "--voice", type=str, default=None,
+        help=(
+            "Voice preset name (e.g. en-Carter_man). Enables headless single-voice mode "
+            "— skips full evaluation loop. Designed for Tier 2 parallel pipelines."
+        ),
+    )
+    parser.add_argument(
+        "--out", type=str, default=None,
+        help="Output WAV file path (default: output_{voice}.wav).",
+    )
+    parser.add_argument(
+        "--steps", type=int, default=None,
+        help=f"DDPM inference steps override (default: {DDPM_STEPS}).",
+    )
+    args = parser.parse_args()
+
+    global DDPM_STEPS
+    if args.steps is not None:
+        DDPM_STEPS = args.steps
+
     print("=" * 60)
     print("  VibeVoice-TTS  |  Quick-Look Evaluation Script")
     print(f"  Model  : {MODEL_PATH}")
     print(f"  Device : {DEVICE.upper()}")
     print(f"  Steps  : {DDPM_STEPS}  (CFG scale = {CFG_SCALE})")
+    if args.voice:
+        print(f"  Mode   : headless  →  voice={args.voice}")
     print("=" * 60)
 
-    # Read & normalise input text
-    if not os.path.exists(INPUT_TXT):
-        sample = (
-            "Welcome to VibeVoice — a long-form, multi-speaker text-to-speech "
-            "system built on a next-token diffusion framework. "
-            "It can synthesise natural, expressive speech for up to ninety minutes "
-            "while maintaining perfect speaker consistency throughout the conversation."
-        )
-        with open(INPUT_TXT, "w", encoding="utf-8") as f:
-            f.write(sample)
-        print(f"  ℹ️   Created sample {INPUT_TXT}")
+    # ── Read & normalise input text ──────────────────────────────────────────
+    if args.text is not None:
+        text = args.text.strip()
+    else:
+        if not os.path.exists(INPUT_TXT):
+            sample = (
+                "Welcome to VibeVoice — a long-form, multi-speaker text-to-speech "
+                "system built on a next-token diffusion framework. "
+                "It can synthesise natural, expressive speech for up to ninety minutes "
+                "while maintaining perfect speaker consistency throughout the conversation."
+            )
+            with open(INPUT_TXT, "w", encoding="utf-8") as f:
+                f.write(sample)
+            print(f"  ℹ️   Created sample {INPUT_TXT}")
 
-    with open(INPUT_TXT, "r", encoding="utf-8") as f:
-        text = f.read().strip()
+        with open(INPUT_TXT, "r", encoding="utf-8") as f:
+            text = f.read().strip()
 
     text = (
         text.replace("\u2018", "'").replace("\u2019", "'")
@@ -571,7 +656,7 @@ def main() -> None:
     preview = text[:110] + ("…" if len(text) > 110 else "")
     print(f"\n  Input : \"{preview}\"  ({len(text)} chars / {len(text.split())} words)\n")
 
-    # Load model
+    # ── Load model ───────────────────────────────────────────────────────────
     try:
         processor, model = load_model(MODEL_PATH, DEVICE)
     except Exception as exc:
@@ -579,9 +664,12 @@ def main() -> None:
         traceback.print_exc()
         raise SystemExit(1)
 
-    # Run both modes
-    run_standard_mode(processor, model, text)
-    run_cloning_mode(processor, model, text)
+    # ── Route: headless single-voice or full evaluation ──────────────────────
+    if args.voice is not None:
+        _run_single_voice(processor, model, text, args.voice, args.out)
+    else:
+        run_standard_mode(processor, model, text)
+        run_cloning_mode(processor, model, text)
 
     print(f"\n{'='*60}")
     print("  ✅  Evaluation complete.")
