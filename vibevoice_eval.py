@@ -39,7 +39,7 @@ REF_AUDIO    = "reference.wav"
 SAMPLE_RATE  = 24_000
 DEVICE       = "cuda" if torch.cuda.is_available() else (
                "mps"  if torch.backends.mps.is_available() else "cpu")
-DDPM_STEPS   = 30
+DDPM_STEPS   = 10   # VibeVoice technical report default; was 30 (3× overkill)
 CFG_SCALE    = 1.5
 CHUNK_SIZE   = 1000   # max chars per synthesis chunk (tweak 500–2000 to balance quality vs memory)
 
