@@ -240,13 +240,14 @@ F5-TTS repo: `github.com/SWivid/F5-TTS`
 ## Implementation Priority
 
 ```
-[ ] Tier 1A — Change DDPM_STEPS = 10 in vibevoice_eval.py       (5 min)
-[ ] Tier 1B — Add torch_dtype=torch.bfloat16 to from_pretrained  (5 min)
-[ ] Tier 1C — Add attn_implementation='sdpa' to from_pretrained  (5 min)
-[ ] Tier 2  — Parallel segment processor script                  (2 hrs)
-[ ] Tier 3  — INT8 quantization via bitsandbytes                 (1 hr)
-[ ] Tier 4A — MLX Qwen backbone (research spike needed)          (days)
-[ ] Tier 4B — Evaluate F5-TTS as an alternative                  (1 day)
+[x] Tier 1A — DDPM_STEPS = 10 in vibevoice_eval.py              (done 2026-05-15)
+[x] Tier 1B — torch_dtype=torch.bfloat16 on MPS                 (done 2026-05-15)
+[x] Tier 1C — attn_implementation='sdpa' on MPS                 (done 2026-05-14)
+[x] Tier 2  — CLI args (--voice, --text, --out, --steps)        (done 2026-05-15)
+[ ] Tier 2  — Parallel segment processor + ffmpeg stitch        (2 hrs)
+[ ] Tier 3  — INT8 quantization via bitsandbytes                (1 hr)
+[ ] Tier 4A — MLX Qwen backbone (research spike needed)         (days)
+[ ] Tier 4B — Evaluate F5-TTS as an alternative                 (1 day)
 ```
 
 ---
